@@ -143,7 +143,19 @@ if not _validate_balance(balance_to_update['balance'], fees, pxq):
     # Update order book after trade execution
     if order_book is not None and is_bid is not None:
         _update_order_book_after_trade(order_book, price, volume, is_bid)
-
+##----
+def _handle_fix_failure(symbol: str, volume: float, price: float, retries: int = 3) -> None:
+    success = False
+    for attempt in range(retries):
+        try:
+            send_fix_order(symbol=symbol, quantity=volume, price=price)
+            success = True
+            break
+        except Exception as e:
+            print(f"Intento {attempt + 1} fallido: {e}")
+    if not success:
+        print(f"No se pudo enviar la orden tras {retries} intentos.")
+##----
 
 def _update_order_book_after_trade(
     order_book: OrderBook,
