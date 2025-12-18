@@ -24,6 +24,19 @@ def _extract_currency(security: str) -> str:
         return 'USD'
     return 'ARS'
 
+def _validate_balance(balance: float, fees: float, transaction_cost: float) -> bool:
+    """
+    Valida si hay suficiente saldo para cubrir la transacción.
+    
+    Args:
+        balance (float): Balance actual en la moneda correspondiente.
+        fees (float): Comisión de mercado en ARS.
+        transaction_cost (float): Costo total (Price x Volume).
+        
+    Returns:
+        bool: True si hay suficiente saldo, False si no.
+    """
+    return balance >= (transaction_cost + fees)
 
 def execute_trade(
     security: str, 
@@ -58,6 +71,14 @@ def execute_trade(
         timestamp_str = timestamp.strftime('%Y-%m-%d %H:%M:%S.%f')
     else:
         timestamp_str = str(timestamp)
+    
+   # ---- Validar saldo antes de ejecutar la transacción
+if not _validate_balance(balance_to_update['balance'], fees, pxq):
+    raise ValueError(
+        f"Saldo insuficiente para transacción en {currency}. "
+        f"Requerido: {transaction_cost + fees:.2f}, Disponible: {balance_to_update['balance']:.2f}"
+    )
+    # ---- 
     
     # Extract currency
     currency = _extract_currency(security)
