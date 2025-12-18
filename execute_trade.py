@@ -152,3 +152,12 @@ def send_fix_order(symbol: str, quantity: float, price: float) -> None:
     """
     print(f"Sending FIX order: {symbol}, {quantity}, {price}, {price * quantity}")
     print(f"Order fulfilled")
+
+
+## --
+    def generate_trade_report(security, pxq, fees, initial_balance, final_balance, success=True):
+    report_status = "EXITOSA" if success else "FALLIDA"
+    print(f"[REPORTE] {report_status}")
+    print(f"Instrumento: {security}, Comisión: {fees:.2f} ARS")
+    print(f"Balance inicial: {initial_balance:.2f}, Balance final: {final_balance:.2f}")
+## -- 
