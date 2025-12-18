@@ -64,10 +64,33 @@ def execute_trade(
     
     # Calculate price x volume (transaction value)
     pxq = price * volume
+
+    #----
+    def calculate_fees(pxq: float, currency: str, final_fx_rate: float) -> float:
+    """
+    Calcula las tarifas de mercado en ARS según el tipo de cambio final del día.
+    
+    Args:
+        pxq (float): Valor total de la transacción (Price x Volume).
+        currency (str): Moneda del instrumento (ARS o USD).
+        final_fx_rate (float): Tipo de cambio oficial al cierre del día.
+        
+    Returns:
+        float: Comisión cobrada en pesos (ARS).
+    """
+    MARKET_FEE_RATE = 0.0001
+    # Si la transacción está en USD, se convierte a ARS usando el tipo de cambio
+    if currency == 'USD':
+        return pxq * MARKET_FEE_RATE * final_fx_rate
+    else:
+        # Si está en ARS, se aplica la tarifa directa
+        return pxq * MARKET_FEE_RATE
+    #----
     
     # Calculate fees (0.0100% = 0.0001)
     MARKET_FEE_RATE = 0.0001
-    fees = pxq * MARKET_FEE_RATE
+    fees = calculate_fees(pxq, currency, final_fx_rate) 
+    #----
     
     # Update balances based on trade side and currency
     # The logic is the same for both currencies:
