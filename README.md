@@ -129,7 +129,7 @@ Para probar:
 ---
 
 ## Créditos
-Este proyecto fue realizado por mmsirera23 como parte de un trabajo práctico final de trading algorítmico. Se aceptan contribuciones a través de pull requests.
+
 
 ---
 ```
