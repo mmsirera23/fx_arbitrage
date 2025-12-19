@@ -24,6 +24,19 @@ def _extract_currency(security: str) -> str:
         return 'USD'
     return 'ARS'
 
+def _validate_balance(balance: float, fees: float, transaction_cost: float) -> bool:
+    """
+    Valida si hay suficiente saldo para cubrir la transacción.
+    
+    Args:
+        balance (float): Balance actual en la moneda correspondiente.
+        fees (float): Comisión de mercado en ARS.
+        transaction_cost (float): Costo total (Price x Volume).
+        
+    Returns:
+        bool: True si hay suficiente saldo, False si no.
+    """
+    return balance >= (transaction_cost + fees)
 
 def execute_trade(
     security: str, 
@@ -59,15 +72,46 @@ def execute_trade(
     else:
         timestamp_str = str(timestamp)
     
+   # ---- Validar saldo antes de ejecutar la transacción
+if not _validate_balance(balance_to_update['balance'], fees, pxq):
+    raise ValueError(
+        f"Saldo insuficiente para transacción en {currency}. "
+        f"Requerido: {transaction_cost + fees:.2f}, Disponible: {balance_to_update['balance']:.2f}"
+    )
+    # ---- 
+    
     # Extract currency
     currency = _extract_currency(security)
     
     # Calculate price x volume (transaction value)
     pxq = price * volume
+
+    #----
+    def calculate_fees(pxq: float, currency: str, final_fx_rate: float) -> float:
+    """
+    Calcula las tarifas de mercado en ARS según el tipo de cambio final del día.
+    
+    Args:
+        pxq (float): Valor total de la transacción (Price x Volume).
+        currency (str): Moneda del instrumento (ARS o USD).
+        final_fx_rate (float): Tipo de cambio oficial al cierre del día.
+        
+    Returns:
+        float: Comisión cobrada en pesos (ARS).
+    """
+    MARKET_FEE_RATE = 0.0001
+    # Si la transacción está en USD, se convierte a ARS usando el tipo de cambio
+    if currency == 'USD':
+        return pxq * MARKET_FEE_RATE * final_fx_rate
+    else:
+        # Si está en ARS, se aplica la tarifa directa
+        return pxq * MARKET_FEE_RATE
+    #----
     
     # Calculate fees (0.0100% = 0.0001)
     MARKET_FEE_RATE = 0.0001
-    fees = pxq * MARKET_FEE_RATE
+    fees = calculate_fees(pxq, currency, final_fx_rate) 
+    #----
     
     # Update balances based on trade side and currency
     # The logic is the same for both currencies:
@@ -99,7 +143,19 @@ def execute_trade(
     # Update order book after trade execution
     if order_book is not None and is_bid is not None:
         _update_order_book_after_trade(order_book, price, volume, is_bid)
-
+##----
+def _handle_fix_failure(symbol: str, volume: float, price: float, retries: int = 3) -> None:
+    success = False
+    for attempt in range(retries):
+        try:
+            send_fix_order(symbol=symbol, quantity=volume, price=price)
+            success = True
+            break
+        except Exception as e:
+            print(f"Intento {attempt + 1} fallido: {e}")
+    if not success:
+        print(f"No se pudo enviar la orden tras {retries} intentos.")
+##----
 
 def _update_order_book_after_trade(
     order_book: OrderBook,
