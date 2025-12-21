@@ -148,4 +148,7 @@ Observaciones y recomendaciones:
 - Se detectaron excepciones de formato en los logs (uso de formatos tipo `% , .2f` pasados como argumentos a `logger`). 
 - Métricas de latencia y PnL se guardan y muestran en consola; para auditoría continua se puede exportar `stats` a CSV/JSON desde `run_data.py`.
 
+---
+## Integrantes del grupo: 
+Milagros Sirera, Jonathan David Fichelson, y Rodrigo Basavilbaso. 
 ```
