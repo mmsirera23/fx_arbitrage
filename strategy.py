@@ -5,8 +5,42 @@ Trading strategy module for triangular arbitrage using AL30 and GD30 bonds.
 from typing import Dict, Optional, Tuple
 from orderbook import OrderBook
 from execute_trade import execute_trade
+import time
+import logging
+
+# Module logger
+logger = logging.getLogger('fx_arbitrage')
+
+# Keep track of the last skipped opportunity to avoid repeated logging
+_last_skipped_opportunity = None
 
 
+def _opportunity_signature(arbitrage_info: Dict) -> Tuple[str, str, float]:
+    """Create a lightweight signature for an opportunity to detect repeats."""
+    return (
+        arbitrage_info.get('buy_pair_name'),
+        arbitrage_info.get('sell_pair_name'),
+        round(arbitrage_info.get('arbitrage_profit_pct', 0.0), 6)
+    )
+
+
+def _should_log_skipped(arbitrage_info: Dict) -> bool:
+    """Return True if this skipped opportunity has not been logged recently.
+
+    Updates the module-level `_last_skipped_opportunity` when a new one is seen.
+    """
+    global _last_skipped_opportunity
+    sig = _opportunity_signature(arbitrage_info)
+    if _last_skipped_opportunity == sig:
+        return False
+    _last_skipped_opportunity = sig
+    return True
+
+
+def _reset_last_skipped() -> None:
+    """Reset the last skipped opportunity marker."""
+    global _last_skipped_opportunity
+    _last_skipped_opportunity = None
 # Hardcoded security pairs available for FX arbitrage
 # These are the 4 instruments: AL30 (pesos), AL30D (dollars), GD30 (pesos), GD30D (dollars)
 # Add more pairs as needed
@@ -20,7 +54,6 @@ ARBITRAGE_SECURITIES = {
         'dollar_security': 'GD30D-0002-C-CT-USD'  # GD30D in dollars
     }
 }
-
 # Market fees (comisiones de mercado)
 # According to "DERECHOS DE MERCADO SOBRE OPERACIONES" table:
 # "Públicos - Obligaciones Negociables": 0.0100% (0.0001 in decimal)
@@ -201,7 +234,8 @@ def execute_arbitrage_opportunities_iteratively(
     timestamp,
     ars_balance: Dict[str, float],
     usd_balance: Dict[str, float],
-    max_iterations: int = 100
+    max_iterations: int = 100,
+    stats: Optional[Dict] = None
 ) -> int:
     """
     Execute arbitrage opportunities iteratively until no more opportunities exist.
@@ -223,7 +257,7 @@ def execute_arbitrage_opportunities_iteratively(
     
     while iteration < max_iterations:
         # Check if there's an arbitrage opportunity
-        opportunity_executed = execute_strategy(order_books, timestamp, ars_balance, usd_balance)
+        opportunity_executed = execute_strategy(order_books, timestamp, ars_balance, usd_balance, stats=stats)
         
         if not opportunity_executed:
             # No more opportunities, break the loop
@@ -346,6 +380,7 @@ def execute_strategy(
     timestamp,
     ars_balance: Dict[str, float],
     usd_balance: Dict[str, float]
+    , stats: Optional[Dict] = None
 ) -> bool:
     """
     Execute a single arbitrage opportunity if one exists.
@@ -363,6 +398,8 @@ def execute_strategy(
     arbitrage_info = check_arbitrage_opportunity(order_books)
     
     if arbitrage_info is None:
+        # No opportunity found -> reset last skipped marker
+        _reset_last_skipped()
         return False
     
     # Calculate maximum volume and nominals based on order book
@@ -370,14 +407,15 @@ def execute_strategy(
     
     if max_nominals <= 0 or max_fx_volume <= 0:
         # No sufficient volume available for this arbitrage opportunity
-        print(f"[ARBITRAGE] Opportunity detected but insufficient volume available")
-        print(f"  Buy Pair: {arbitrage_info['buy_pair_name']}, Sell Pair: {arbitrage_info['sell_pair_name']}")
-        print(f"  Potential Profit (after fees): {arbitrage_info['arbitrage_profit_pct']:.4f}%")
-        print(f"  Available volumes:")
-        print(f"    Buy leg: {min(arbitrage_info['peso_buy_volume'], arbitrage_info['dollar_buy_volume']):.2f} nominals")
-        print(f"    Sell leg: {min(arbitrage_info['dollar_sell_volume'], arbitrage_info['peso_sell_volume']):.2f} nominals")
-        print(f"  Maximum tradable nominals: {max_nominals} (minimum required: 1)")
-        print(f"  Skipping trade execution")
+        if _should_log_skipped(arbitrage_info):
+            logger.info("[ARBITRAGE] Opportunity detected but insufficient volume available")
+            logger.info("  Buy Pair: %s, Sell Pair: %s", arbitrage_info['buy_pair_name'], arbitrage_info['sell_pair_name'])
+            logger.info("  Potential Profit (after fees): %.4f%%", arbitrage_info['arbitrage_profit_pct'])
+            logger.debug("  Available volumes:")
+            logger.debug("    Buy leg: %.2f nominals", min(arbitrage_info['peso_buy_volume'], arbitrage_info['dollar_buy_volume']))
+            logger.debug("    Sell leg: %.2f nominals", min(arbitrage_info['dollar_sell_volume'], arbitrage_info['peso_sell_volume']))
+            logger.info("  Maximum tradable nominals: %d (minimum required: 1)", max_nominals)
+            logger.info("  Skipping trade execution")
         return False
     
     # Store initial balances
@@ -385,179 +423,134 @@ def execute_strategy(
     initial_usd = usd_balance['balance']
     
     MARKET_FEE_RATE = 0.0001
-    
-    # Calculate maximum USD we can SELL (steps 3 and 4)
-    # Step 3: Buy dollar bond (sell pair) - min volume between dollar_sell_volume and peso_sell_volume
-    # Step 4: Sell peso bond (sell pair) - same nominals
-    # The limiting factor is the minimum volume between these two orders
+
+    # Determine limits from order books
     max_nominals_sell = min(
         arbitrage_info['dollar_sell_volume'],
         arbitrage_info['peso_sell_volume']
     )
-    dollar_sell_price_original = arbitrage_info['dollar_sell_price_original']
-    # USD we can sell = volume of dollar bond we can buy (step 3)
-    max_usd_sell = max_nominals_sell * dollar_sell_price_original
-    
-    # Calculate maximum USD we can PURCHASE (steps 1 and 2)
-    # Step 1: Buy peso bond (buy pair) - limited by peso_buy_volume and ARS balance
-    # Step 2: Sell dollar bond (buy pair) - limited by dollar_buy_volume
-    # The limiting factor is the minimum between:
-    #   - Order book volumes (peso_buy_volume, dollar_buy_volume)
-    #   - ARS balance available (how much we can spend)
-    
-    # First, calculate max nominals from order book volumes
+
+    # Buy side limits (orderbook + ARS balance)
     max_nominals_buy_orderbook = min(
         arbitrage_info['peso_buy_volume'],
         arbitrage_info['dollar_buy_volume']
     )
-    
-    # Calculate max nominals we can afford with ARS balance
+
     peso_buy_price_original = arbitrage_info['peso_buy_price_original']
     peso_buy_cost_per_nominal = peso_buy_price_original * (1 + MARKET_FEE_RATE)
-    
+
+    # Compute how many nominals ARS can afford (float) and limit by orderbook
     if initial_ars < peso_buy_cost_per_nominal:
-        # Not enough ARS even for 1 nominal
-        max_nominals_buy_by_ars = 0
+        max_nominals_buy = 0.0
     else:
-        max_nominals_buy_by_ars = int(initial_ars / peso_buy_cost_per_nominal)
-    
-    # Maximum nominals we can buy is the minimum of order book and ARS balance
-    max_nominals_buy = min(max_nominals_buy_orderbook, max_nominals_buy_by_ars)
-    
-    # Calculate USD we can purchase (what we receive from selling dollar bond in step 2)
+        max_nominals_buy = min(max_nominals_buy_orderbook, initial_ars / peso_buy_cost_per_nominal)
+
+    # USD proceeds per nominal from selling dollar bond in buy-pair (step 2)
     dollar_buy_price_original = arbitrage_info['dollar_buy_price_original']
-    dollar_buy_proceeds_per_nominal = dollar_buy_price_original * (1 - MARKET_FEE_RATE)  # We receive less due to fees
-    max_usd_purchase = max_nominals_buy * dollar_buy_proceeds_per_nominal
-    
-    # Also need to verify USD balance constraint for step 3
-    # After step 2, we'll have: initial_usd + (nominals * dollar_buy_proceeds_per_nominal)
-    # For step 3, we need: nominals * dollar_sell_cost_per_nominal (with fees)
-    dollar_sell_cost_per_nominal = dollar_sell_price_original * (1 + MARKET_FEE_RATE)  # We pay more due to fees
-    usd_needed_per_nominal = dollar_sell_cost_per_nominal - dollar_buy_proceeds_per_nominal
-    
-    if usd_needed_per_nominal > 0:
-        # We need additional USD balance
-        if initial_usd < 0:
-            # Negative balance: can't proceed
-            max_usd_purchase = 0
-        else:
-            # Calculate max nominals based on USD balance
-            # We need: initial_usd >= nominals * usd_needed_per_nominal
-            max_nominals_by_usd = int(initial_usd / usd_needed_per_nominal)
-            max_usd_purchase_by_usd = max_nominals_by_usd * dollar_buy_proceeds_per_nominal
-            max_usd_purchase = min(max_usd_purchase, max_usd_purchase_by_usd)
+    dollar_buy_proceeds_per_nominal = dollar_buy_price_original * (1 - MARKET_FEE_RATE)
+
+    # USD cost per nominal to buy dollar bond in sell-pair (step 3)
+    dollar_sell_price_original = arbitrage_info['dollar_sell_price_original']
+    dollar_sell_cost_per_nominal = dollar_sell_price_original * (1 + MARKET_FEE_RATE)
+
+    # USD available after performing the buy-pair sell (step 2)
+    usd_available_after_step2 = initial_usd + (max_nominals_buy * dollar_buy_proceeds_per_nominal)
+
+    # Max nominals limited by USD availability for step 3
+    if dollar_sell_cost_per_nominal > 0:
+        max_nominals_by_usd = usd_available_after_step2 / dollar_sell_cost_per_nominal
     else:
-        # dollar_sell_cost <= dollar_buy_proceeds, so step 2 provides enough USD for step 3
-        # No additional USD balance needed
-        pass
-    
-    # Final volume: min(max_usd_purchase, max_usd_sell)
-    max_fx_volume_usd = min(max_usd_purchase, max_usd_sell)
-    
-    if max_fx_volume_usd <= 0:
-        print(f"[ARBITRAGE] Opportunity detected but insufficient volume or balance")
-        print(f"  Buy Pair: {arbitrage_info['buy_pair_name']}, Sell Pair: {arbitrage_info['sell_pair_name']}")
-        print(f"  Potential Profit (after fees): {arbitrage_info['arbitrage_profit_pct']:.4f}%")
-        print(f"  Max USD purchase (steps 1-2): {max_usd_purchase:,.2f}")
-        print(f"  Max USD sell (steps 3-4): {max_usd_sell:,.2f}")
-        print(f"  Available ARS balance: {initial_ars:,.2f}")
-        print(f"  Available USD balance: {initial_usd:,.2f}")
-        print(f"  Skipping trade execution")
-        return False
-    
-    # Calculate actual nominals based on the limiting USD volume
-    # Use the purchase side to determine nominals (since that's what we can afford)
-    if max_fx_volume_usd == max_usd_purchase:
-        # Limited by purchase capacity
-        actual_nominals = max_nominals_buy
-    else:
-        # Limited by sell capacity
-        actual_nominals = max_nominals_sell
-    
-    # Ensure we don't exceed the other constraint
-    actual_nominals = min(actual_nominals, max_nominals_buy, max_nominals_sell)
-    
+        max_nominals_by_usd = 0.0
+
+    # Ensure final USD after all four trades will not be negative.
+    # USD net change per nominal = proceeds from selling in buy-pair - cost to buy in sell-pair
+    usd_delta_per_nominal = dollar_buy_proceeds_per_nominal - dollar_sell_cost_per_nominal
+    # Do not preemptively cap final nominals based on USD (allow execution and warn after)
+    max_nominals_by_final_usd = float('inf')
+
+    # Final nominal capacity (float). Avoid truncating to int until final decision.
+    final_nominals_capacity = min(max_nominals_buy, max_nominals_sell, max_nominals_by_usd, max_nominals_by_final_usd)
+
+    actual_nominals = int(final_nominals_capacity)
+
     if actual_nominals <= 0:
-        print(f"[ARBITRAGE] Opportunity detected but insufficient volume or balance")
-        print(f"  Buy Pair: {arbitrage_info['buy_pair_name']}, Sell Pair: {arbitrage_info['sell_pair_name']}")
-        print(f"  Potential Profit (after fees): {arbitrage_info['arbitrage_profit_pct']:.4f}%")
-        print(f"  Max USD purchase: {max_usd_purchase:,.2f}")
-        print(f"  Max USD sell: {max_usd_sell:,.2f}")
-        print(f"  Calculated nominals: {actual_nominals}")
-        print(f"  Skipping trade execution")
+        if _should_log_skipped(arbitrage_info):
+            logger.info("[ARBITRAGE] Opportunity detected but insufficient volume or balance")
+            logger.info("  Buy Pair: %s, Sell Pair: %s", arbitrage_info['buy_pair_name'], arbitrage_info['sell_pair_name'])
+            logger.info("  Potential Profit (after fees): %.4f%%", arbitrage_info['arbitrage_profit_pct'])
+            logger.debug("  Max nominals (buy/orderbook): %.2f", max_nominals_buy)
+            logger.debug("  Max nominals (sell/orderbook): %.2f", max_nominals_sell)
+            logger.debug("  Max nominals (by USD availability): %.2f", max_nominals_by_usd)
+            logger.debug("  Available ARS balance: %,.2f", initial_ars)
+            logger.debug("  Available USD balance: %,.2f", initial_usd)
+            logger.info("  Skipping trade execution")
         return False
-    
-    # Execute the trade with calculated nominals
-    # Note: Balances will be updated by execute_trade() for each trade using original prices + fees
+
     trade_result = execute_arbitrage_trade(order_books, actual_nominals, arbitrage_info)
-    
+
     # Print trade details
-    print(f"\n{'='*60}")
-    print(f"ARBITRAGE OPPORTUNITY DETECTED at {timestamp}")
-    print(f"{'='*60}")
-    print(f"Buy Pair: {arbitrage_info['buy_pair_name']}")
-    print(f"Sell Pair: {arbitrage_info['sell_pair_name']}")
+    logger.info("%s", "="*60)
+    logger.info("ARBITRAGE OPPORTUNITY DETECTED at %s", timestamp)
+    logger.info("%s", "="*60)
+    logger.info("Buy Pair: %s", arbitrage_info['buy_pair_name'])
+    logger.info("Sell Pair: %s", arbitrage_info['sell_pair_name'])
     
     # Detailed FX calculation breakdown
-    print(f"\n{'─'*60}")
-    print(f"IMPLICIT FX CALCULATION DETAILS:")
-    print(f"{'─'*60}")
+    logger.info("%s", "─"*60)
+    logger.info("IMPLICIT FX CALCULATION DETAILS:")
+    logger.info("%s", "─"*60)
     
     # FX Buy calculation
-    print(f"\nFX Buy (after fees): {arbitrage_info['implicit_fx_buy']:.4f} ARS/USD")
-    print(f"  To buy USD via {arbitrage_info['buy_pair_name']}:")
-    print(f"    Buy {arbitrage_info['peso_buy_security']}:")
-    print(f"      Price (original): {arbitrage_info['peso_buy_price_original']:.2f} ARS")
-    print(f"      Price (with fees): {arbitrage_info['peso_buy_price']:.2f} ARS")
-    print(f"      Available volume: {arbitrage_info['peso_buy_volume']:.2f} nominals")
-    print(f"    Sell {arbitrage_info['dollar_buy_security']}:")
-    print(f"      Price (original): {arbitrage_info['dollar_buy_price_original']:.2f} USD")
-    print(f"      Price (with fees): {arbitrage_info['dollar_buy_price']:.2f} USD")
-    print(f"      Available volume: {arbitrage_info['dollar_buy_volume']:.2f} nominals")
-    print(f"    Calculation: {arbitrage_info['peso_buy_price']:.2f} / {arbitrage_info['dollar_buy_price']:.2f} = {arbitrage_info['implicit_fx_buy']:.4f}")
+    logger.info("FX Buy (after fees): %.4f ARS/USD", arbitrage_info['implicit_fx_buy'])
+    logger.debug("  To buy USD via %s:", arbitrage_info['buy_pair_name'])
+    logger.debug("    Buy %s:", arbitrage_info['peso_buy_security'])
+    logger.debug("      Price (original): %.2f ARS", arbitrage_info['peso_buy_price_original'])
+    logger.debug("      Price (with fees): %.2f ARS", arbitrage_info['peso_buy_price'])
+    logger.debug("      Available volume: %.2f nominals", arbitrage_info['peso_buy_volume'])
+    logger.debug("    Sell %s:", arbitrage_info['dollar_buy_security'])
+    logger.debug("      Price (original): %.2f USD", arbitrage_info['dollar_buy_price_original'])
+    logger.debug("      Price (with fees): %.2f USD", arbitrage_info['dollar_buy_price'])
+    logger.debug("      Available volume: %.2f nominals", arbitrage_info['dollar_buy_volume'])
+    logger.debug("    Calculation: %.2f / %.2f = %.4f", arbitrage_info['peso_buy_price'], arbitrage_info['dollar_buy_price'], arbitrage_info['implicit_fx_buy'])
     
     # FX Sell calculation
-    print(f"\nFX Sell (after fees): {arbitrage_info['implicit_fx_sell']:.4f} ARS/USD")
-    print(f"  To sell USD via {arbitrage_info['sell_pair_name']}:")
-    print(f"    Buy {arbitrage_info['dollar_sell_security']}:")
-    print(f"      Price (original): {arbitrage_info['dollar_sell_price_original']:.2f} USD")
-    print(f"      Price (with fees): {arbitrage_info['dollar_sell_price']:.2f} USD")
-    print(f"      Available volume: {arbitrage_info['dollar_sell_volume']:.2f} nominals")
-    print(f"    Sell {arbitrage_info['peso_sell_security']}:")
-    print(f"      Price (original): {arbitrage_info['peso_sell_price_original']:.2f} ARS")
-    print(f"      Price (with fees): {arbitrage_info['peso_sell_price']:.2f} ARS")
-    print(f"      Available volume: {arbitrage_info['peso_sell_volume']:.2f} nominals")
-    print(f"    Calculation: {arbitrage_info['peso_sell_price']:.2f} / {arbitrage_info['dollar_sell_price']:.2f} = {arbitrage_info['implicit_fx_sell']:.4f}")
+    logger.info("FX Sell (after fees): %.4f ARS/USD", arbitrage_info['implicit_fx_sell'])
+    logger.debug("  To sell USD via %s:", arbitrage_info['sell_pair_name'])
+    logger.debug("    Buy %s:", arbitrage_info['dollar_sell_security'])
+    logger.debug("      Price (original): %.2f USD", arbitrage_info['dollar_sell_price_original'])
+    logger.debug("      Price (with fees): %.2f USD", arbitrage_info['dollar_sell_price'])
+    logger.debug("      Available volume: %.2f nominals", arbitrage_info['dollar_sell_volume'])
+    logger.debug("    Sell %s:", arbitrage_info['peso_sell_security'])
+    logger.debug("      Price (original): %.2f ARS", arbitrage_info['peso_sell_price_original'])
+    logger.debug("      Price (with fees): %.2f ARS", arbitrage_info['peso_sell_price'])
+    logger.debug("      Available volume: %.2f nominals", arbitrage_info['peso_sell_volume'])
+    logger.debug("    Calculation: %.2f / %.2f = %.4f", arbitrage_info['peso_sell_price'], arbitrage_info['dollar_sell_price'], arbitrage_info['implicit_fx_sell'])
     
-    print(f"\nArbitrage Profit (after fees): {arbitrage_info['arbitrage_profit_pct']:.4f}%")
-    print(f"\nTrade Execution:")
-    print(f"  FX Volume (dollars): {trade_result['volume']:.2f}")
-    print(f"  Nominals: {trade_result['nominals']}")
-    print(f"  Peso Buy Cost (pesos, with fees): {trade_result['peso_buy_cost']:.2f}")
-    print(f"  Dollar Buy Proceeds (dollars, with fees): {trade_result['dollar_buy_proceeds']:.2f}")
-    print(f"  Dollar Sell Cost (dollars, with fees): {trade_result['dollar_sell_cost']:.2f}")
-    print(f"  Peso Sell Proceeds (pesos, with fees): {trade_result['peso_sell_proceeds']:.2f}")
-    print(f"  Net Profit (pesos, after fees): {trade_result['net_profit_pesos']:.2f}")
-    print(f"  Return (after fees): {trade_result['return_pct']:.4f}%")
-    print(f"\nBalance Changes:")
-    print(f"  ARS: {initial_ars:,.2f} -> {ars_balance['balance']:,.2f} (change: {ars_balance['balance'] - initial_ars:+,.2f})")
-    print(f"  USD: {initial_usd:,.2f} -> {usd_balance['balance']:,.2f} (change: {usd_balance['balance'] - initial_usd:+,.2f})")
-    if usd_balance['balance'] < 0:
-        print(f"  WARNING: USD balance is negative! {usd_balance['balance']:.2f}")
-        # interrupt code execution
-        exit()
+    logger.info("Arbitrage Profit (after fees): %.4f%%", arbitrage_info['arbitrage_profit_pct'])
+    logger.info("Trade Execution:")
+    logger.info("  FX Volume (dollars): %.2f", trade_result['volume'])
+    logger.info("  Nominals: %d", trade_result['nominals'])
+    logger.info("  Peso Buy Cost (pesos, with fees): %.2f", trade_result['peso_buy_cost'])
+    logger.info("  Dollar Buy Proceeds (dollars, with fees): %.2f", trade_result['dollar_buy_proceeds'])
+    logger.info("  Dollar Sell Cost (dollars, with fees): %.2f", trade_result['dollar_sell_cost'])
+    logger.info("  Peso Sell Proceeds (pesos, with fees): %.2f", trade_result['peso_sell_proceeds'])
+    logger.info("  Net Profit (pesos, after fees): %.2f", trade_result['net_profit_pesos'])
+    logger.info("  Return (after fees): %.4f%%", trade_result['return_pct'])
+    logger.info("Balance Changes:")
+    logger.info("  ARS: %,.2f -> %,.2f (change: %+.2f)", initial_ars, ars_balance['balance'], ars_balance['balance'] - initial_ars)
+    logger.info("  USD: %,.2f -> %,.2f (change: %+.2f)", initial_usd, usd_balance['balance'], usd_balance['balance'] - initial_usd)
+    logger.debug("Balance snapshot BEFORE execution:")
+    logger.debug("  ARS: %,.2f", initial_ars)
+    logger.debug("  USD: %,.2f", initial_usd)
 
-
-    print(f"{'='*60}")
-    
     # Execute 4 trades by sending orders to market via FIX
-    # Each trade is executed separately
-    # Use original prices (market execution prices) for trade execution
     nominals = trade_result['nominals']
-    
+
+    start = time.perf_counter()
+
     # Trade 1: Buy peso bond (buy pair) - buy from offers (is_bid=False)
-    # This will spend ARS (price + fees) - balances updated in execute_trade()
-    execute_trade(
+    order_metrics = []
+    res = execute_trade(
         arbitrage_info['peso_buy_security'],
         arbitrage_info['peso_buy_price_original'],
         nominals,
@@ -567,10 +560,11 @@ def execute_strategy(
         ars_balance=ars_balance,
         usd_balance=usd_balance
     )
-    
+    if res:
+        order_metrics.append(res)
+
     # Trade 2: Sell dollar bond (buy pair) - sell to bids (is_bid=True)
-    # This will receive USD (price - fees) - balances updated in execute_trade()
-    execute_trade(
+    res = execute_trade(
         arbitrage_info['dollar_buy_security'],
         arbitrage_info['dollar_buy_price_original'],
         nominals,
@@ -580,10 +574,11 @@ def execute_strategy(
         ars_balance=ars_balance,
         usd_balance=usd_balance
     )
-    
+    if res:
+        order_metrics.append(res)
+
     # Trade 3: Buy dollar bond (sell pair) - buy from offers (is_bid=False)
-    # This will spend USD (price + fees) - balances updated in execute_trade()
-    execute_trade(
+    res = execute_trade(
         arbitrage_info['dollar_sell_security'],
         arbitrage_info['dollar_sell_price_original'],
         nominals,
@@ -593,10 +588,11 @@ def execute_strategy(
         ars_balance=ars_balance,
         usd_balance=usd_balance
     )
-    
+    if res:
+        order_metrics.append(res)
+
     # Trade 4: Sell peso bond (sell pair) - sell to bids (is_bid=True)
-    # This will receive ARS (price - fees) - balances updated in execute_trade()
-    execute_trade(
+    res = execute_trade(
         arbitrage_info['peso_sell_security'],
         arbitrage_info['peso_sell_price_original'],
         nominals,
@@ -606,5 +602,47 @@ def execute_strategy(
         ars_balance=ars_balance,
         usd_balance=usd_balance
     )
-    
+    if res:
+        order_metrics.append(res)
+
+    end = time.perf_counter()
+    latency_ms = (end - start) * 1000.0
+
+    # PnL after execution (balances updated in execute_trade)
+    final_ars = ars_balance['balance']
+    final_usd = usd_balance['balance']
+    pnl_ars = final_ars - initial_ars
+    pnl_usd = final_usd - initial_usd
+
+    # Update stats accumulator if provided
+    if stats is not None:
+        stats.setdefault('total_latency_ms', 0.0)
+        stats.setdefault('total_order_latency_ms', 0.0)
+        stats.setdefault('total_pnl_ars', 0.0)
+        stats.setdefault('total_pnl_usd', 0.0)
+        stats.setdefault('trades_executed', 0)
+        stats.setdefault('orders_executed', 0)
+
+        stats['total_latency_ms'] += latency_ms
+        # sum per-order latencies
+        sum_order_latency = sum((m.get('latency_ms', 0.0) for m in order_metrics))
+        stats['total_order_latency_ms'] += sum_order_latency
+        stats['total_pnl_ars'] += pnl_ars
+        stats['total_pnl_usd'] += pnl_usd
+        stats['trades_executed'] += 1
+        stats['orders_executed'] += len(order_metrics)
+
+    logger.info("Execution latency: %.2f ms", latency_ms)
+    logger.info("Balance Changes AFTER execution:")
+    logger.info("  ARS: %,.2f -> %,.2f (change: %+.2f)", initial_ars, final_ars, pnl_ars)
+    logger.info("  USD: %,.2f -> %,.2f (change: %+.2f)", initial_usd, final_usd, pnl_usd)
+    if final_usd < 0:
+        logger.warning("  WARNING: USD balance is negative after execution: %.2f", final_usd)
+
+    logger.info("%s", "="*60)
+
+    # Successful execution -> reset last skipped marker so future identical
+    # opportunities will be logged again if they reappear
+    _reset_last_skipped()
+
     return True

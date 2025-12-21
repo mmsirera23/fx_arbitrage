@@ -72,7 +72,7 @@ tpFinal/
 ### Ejecutar el procesamiento de datos
 ```bash
 # Desde el directorio raíz del proyecto
-python fx_orderbook.py
+python orderbook.py
 ```
 
 ### Ejecutar la estrategia de arbitraje FX
@@ -128,8 +128,24 @@ Para probar:
 
 ---
 
-## Créditos
+## Resultados de la simulación (ejecución reciente)
 
+Resumen de métricas obtenidas al ejecutar la simulación con un capital inicial de 500.000.000 ARS:
 
----
+- Trades ejecutados: 111
+- Órdenes ejecutadas (legs): 444
+- Latencia total (por arbitraje): 31.56 ms
+- Latencia total (órdenes): 12.06 ms
+- Latencia media por orden: 0.03 ms
+- PnL total (ARS): 279,512,694.56
+- PnL total (USD): -78,350.08
+- Balance final ARS: 779,512,694.56
+- Balance final USD: -78,350.08
+
+Observaciones y recomendaciones:
+
+- El run mostró un PnL positivo en ARS pero saldo USD negativo al final. Esto puede deberse a la secuencia de legs y al modelado simplificado del flujo de caja entre legs; si es inaceptable, consideramos aplicar una política conservadora que impida ejecutar arbitrajes que dejen el `USD` en negativo.
+- Se detectaron excepciones de formato en los logs (uso de formatos tipo `% , .2f` pasados como argumentos a `logger`). 
+- Métricas de latencia y PnL se guardan y muestran en consola; para auditoría continua se puede exportar `stats` a CSV/JSON desde `run_data.py`.
+
 ```

@@ -9,6 +9,8 @@ from typing import Dict, Optional, Tuple
 
 from orderbook import OrderBook
 from strategy import execute_strategy, ARBITRAGE_SECURITIES
+import logging
+import argparse
 
 def read_market_data(file_path: str) -> pd.DataFrame:
     """
@@ -97,7 +99,8 @@ def process_market_data_updates(
     all_data: pd.DataFrame, 
     order_books: Dict[str, OrderBook],
     ars_balance: Dict[str, float],
-    usd_balance: Dict[str, float]
+    usd_balance: Dict[str, float],
+    stats: Optional[Dict] = None
 ) -> None:
     """
     Process all market data updates in chronological order.
@@ -142,7 +145,7 @@ def process_market_data_updates(
         # This will execute the 4-trade strategy multiple times if opportunities persist
         from strategy import execute_arbitrage_opportunities_iteratively
         opportunities_executed = execute_arbitrage_opportunities_iteratively(
-            order_books, timestamp, ars_balance, usd_balance
+            order_books, timestamp, ars_balance, usd_balance, stats=stats
         )
         
         # Strategy execution complete, clear the flag
@@ -167,7 +170,7 @@ def process_market_data_updates(
         # Use the timestamp of the current market update
         from strategy import execute_arbitrage_opportunities_iteratively
         opportunities_executed = execute_arbitrage_opportunities_iteratively(
-            order_books, timestamp, ars_balance, usd_balance
+            order_books, timestamp, ars_balance, usd_balance, stats=stats
         )
     
     print(f"  - Processed {len(all_data)} updates")
@@ -231,8 +234,11 @@ def run(data_dir: str = "data", initial_balance: float = 0.0) -> Tuple[Dict[str,
     print(f"Initial Balance: ARS {ars_balance['balance']:,.2f}, USD {usd_balance['balance']:,.2f}")
     print("-" * 60)
     
+    # Initialize stats accumulator for PnL / latency
+    stats: Dict = {}
+
     # Process all updates in chronological order
-    process_market_data_updates(all_data, order_books, ars_balance, usd_balance)
+    process_market_data_updates(all_data, order_books, ars_balance, usd_balance, stats=stats)
     
     print("-" * 60)
     print(f"\nProcessing completed.")
@@ -242,27 +248,49 @@ def run(data_dir: str = "data", initial_balance: float = 0.0) -> Tuple[Dict[str,
     print("\nOrder Books Summary:")
     for security, ob in order_books.items():
         print(f"  {ob}")
+
+    # Print aggregated stats if available
+    if stats:
+        print("\nRUN STATS:")
+        print(f"  Trades executed: {stats.get('trades_executed', 0)}")
+        print(f"  Total latency (ms): {stats.get('total_latency_ms', 0.0):.2f}")
+        print(f"  Total PnL ARS: {stats.get('total_pnl_ars', 0.0):,.2f}")
+        print(f"  Total PnL USD: {stats.get('total_pnl_usd', 0.0):,.2f}")
+        print(f"  Orders executed: {stats.get('orders_executed', 0)}")
+        total_order_latency = stats.get('total_order_latency_ms', 0.0)
+        orders_executed = stats.get('orders_executed', 0)
+        avg_order_latency = (total_order_latency / orders_executed) if orders_executed > 0 else 0.0
+        print(f"  Total order latency (ms): {total_order_latency:.2f}")
+        print(f"  Avg order latency (ms): {avg_order_latency:.2f}")
     
     return order_books, ars_balance['balance'], usd_balance['balance']
 
 if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="Process market data and run arbitrage simulation")
+    parser.add_argument('-v', '--verbose', action='store_true', help='Enable debug logging')
+    parser.add_argument('--initial-balance', type=float, default=500_000_000, help='Initial ARS balance')
+    args = parser.parse_args()
 
-    INITIAL_BALANCE = 500_000_000
+    # Configure logging
+    log_level = logging.DEBUG if args.verbose else logging.INFO
+    logging.basicConfig(level=log_level, format='%(asctime)s %(levelname)s %(name)s: %(message)s')
+    logger = logging.getLogger('fx_arbitrage')
+
+    INITIAL_BALANCE = args.initial_balance
     # Execute processing
     order_books, final_ars_balance, final_usd_balance = run(initial_balance=INITIAL_BALANCE)
-    
+
     # Log final balances
-    print("\n" + "=" * 60)
-    print("FINAL BALANCES")
-    print("=" * 60)
-    print(f"ARS Balance: {final_ars_balance:,.2f}")
-    print(f"USD Balance: {final_usd_balance:,.2f}")
-    print(f"Initial ARS Balance: {INITIAL_BALANCE:,.2f}")
-    print(f"Net Change ARS: {final_ars_balance - INITIAL_BALANCE:,.2f}")
-    print("=" * 60)
-    
+    logger.info('%s', '=' * 60)
+    logger.info('FINAL BALANCES')
+    logger.info('%s', '=' * 60)
+    logger.info('ARS Balance: %,.2f', final_ars_balance)
+    logger.info('USD Balance: %,.2f', final_usd_balance)
+    logger.info('Initial ARS Balance: %,.2f', INITIAL_BALANCE)
+    logger.info('Net Change ARS: %,.2f', final_ars_balance - INITIAL_BALANCE)
+    logger.info('%s', '=' * 60)
+
     # Hardcoded security pairs available for FX arbitrage
-    # These are the 4 instruments: AL30 (pesos), AL30D (dollars), GD30 (pesos), GD30D (dollars)
     arbitrage_securities = ARBITRAGE_SECURITIES
     
     # Create array of pairs that can interact for arbitrage
@@ -280,23 +308,23 @@ if __name__ == "__main__":
                 'pair2_peso': arbitrage_securities[pair2_name]['peso_security'],
                 'pair2_dollar': arbitrage_securities[pair2_name]['dollar_security']
             })
-    
-    print("\n" + "=" * 60)
-    print("Arbitrage Securities Available:")
-    print("=" * 60)
-    print(f"Total bond pairs: {len(arbitrage_securities)}")
-    print(f"Total arbitrage combinations: {len(arbitrage_pairs)}")
-    print("\nBond Pairs:")
+
+    logger.info('%s', '=' * 60)
+    logger.info('Arbitrage Securities Available:')
+    logger.info('%s', '=' * 60)
+    logger.info('Total bond pairs: %d', len(arbitrage_securities))
+    logger.info('Total arbitrage combinations: %d', len(arbitrage_pairs))
+    logger.info('\nBond Pairs:')
     for pair_name, securities in arbitrage_securities.items():
-        print(f"  {pair_name}:")
-        print(f"    Peso: {securities['peso_security']}")
-        print(f"    Dollar: {securities['dollar_security']}")
-    
-    print("\nArbitrage Combinations:")
+        logger.info('  %s:', pair_name)
+        logger.info('    Peso: %s', securities['peso_security'])
+        logger.info('    Dollar: %s', securities['dollar_security'])
+
+    logger.info('\nArbitrage Combinations:')
     for combo in arbitrage_pairs:
-        print(f"  {combo['pair1']} <-> {combo['pair2']}")
-        print(f"    Direction 1: Buy USD via {combo['pair1']}, Sell USD via {combo['pair2']}")
-        print(f"    Direction 2: Buy USD via {combo['pair2']}, Sell USD via {combo['pair1']}")
+        logger.info('  %s <-> %s', combo['pair1'], combo['pair2'])
+        logger.info('    Direction 1: Buy USD via %s, Sell USD via %s', combo['pair1'], combo['pair2'])
+        logger.info('    Direction 2: Buy USD via %s, Sell USD via %s', combo['pair2'], combo['pair1'])
     
 
 
