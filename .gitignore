@@ -33,3 +33,6 @@ dist/
 build/
 *.egg-info/
 
+
+# Claude Code (permisos locales, pueden tener secretos)
+.claude/settings.local.json
